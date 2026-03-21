@@ -67,7 +67,7 @@ If you want to test InfiniDepth before running local CLI inference, start with t
 
 This repo also includes a Gradio Space entrypoint at `app.py`:
 
-- input: RGB image (required), depth map (optional)
+- Input: RGB image (required), depth map (optional)
 - Task Switch: `Depth` / `3DGS`
 - Model Switch: `InfiniDepth` / `InfiniDepth_DepthSensor`
 
