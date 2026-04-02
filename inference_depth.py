@@ -21,6 +21,7 @@ from InfiniDepth.utils.io_utils import (
     depth2pcd,
     depth_to_disparity,
     load_image,
+    load_image_from_array,
     plot_depth,
     save_depth_array,
     save_sampled_point_clouds,
@@ -112,6 +113,110 @@ def load_depth_model(args: DepthInferenceArgs) -> tuple[torch.nn.Module, torch.d
     return model, torch.device("cuda")
 
 
+def _depth_map_spatial_shape(depth_map: np.ndarray) -> tuple[int, int]:
+    d = np.squeeze(np.asarray(depth_map))
+    if d.ndim != 2:
+        raise ValueError(
+            f"depth_map must be 2D or broadcastable to HxW after squeeze, got shape {np.asarray(depth_map).shape}"
+        )
+    return int(d.shape[0]), int(d.shape[1])
+
+
+def assert_depth_aspect_matches_image(
+    depth_h: int,
+    depth_w: int,
+    org_h: int,
+    org_w: int,
+    *,
+    rtol: float = 0.02,
+    atol: float = 1e-5,
+) -> None:
+    """Require depth and RGB to share the same aspect ratio before resize-to-input_size."""
+    ri = org_h / float(org_w)
+    rd = depth_h / float(depth_w)
+    if not np.isclose(ri, rd, rtol=rtol, atol=atol):
+        raise ValueError(
+            f"Depth map size {depth_h}x{depth_w} (aspect {rd:.6f}) does not match image "
+            f"{org_h}x{org_w} (aspect {ri:.6f}). Intrinsics are defined for the image pixels; "
+            "the depth grid must match that aspect ratio (sizes may differ)."
+        )
+
+
+def load_rgb_for_depth_inference(
+    *,
+    frame_image_path: Optional[str],
+    input_image_rgb: Optional[np.ndarray],
+    input_size: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """
+    Load and resize RGB to ``input_size`` (same behavior as ``load_image``), from a path or HxWx3 array.
+    If ``input_image_rgb`` is set, it is used for pixels and ``frame_image_path`` is ignored for loading
+    (but may still be used elsewhere as a label).
+    """
+    if input_image_rgb is not None:
+        org_img, image, (org_h, org_w) = load_image_from_array(input_image_rgb, input_size)
+        return org_img, image, org_h, org_w
+    if frame_image_path is None:
+        raise ValueError("Provide `input_image_rgb` or a valid `frame_image_path`.")
+    org_img, image, (org_h, org_w) = load_image(frame_image_path, input_size)
+    return org_img, image, org_h, org_w
+
+
+def load_and_preprocess_depth_inference_inputs(
+    *,
+    input_size: tuple[int, int],
+    device: torch.device,
+    moge2_pretrained: str,
+    frame_image_path: Optional[str],
+    input_image_rgb: Optional[np.ndarray],
+    frame_depth_path: Optional[str],
+    input_depth_map: Optional[np.ndarray],
+    depth_load_kwargs: Optional[dict],
+    skip_metric_depth_inputs: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    bool,
+    Optional[tuple[float, float, float, float]],
+]:
+    """
+    Resize RGB to model input size, optionally validate depth aspect ratio vs RGB, and build
+    metric-depth tensors for the model (MoGe-2 or file/array depth), matching ``prepare_metric_depth_inputs``.
+
+    When ``skip_metric_depth_inputs`` is True (InfiniDepth + external override), only RGB is loaded;
+    depth tensors are left None and MoGe-2 is not run.
+    """
+    org_img, image, org_h, org_w = load_rgb_for_depth_inference(
+        frame_image_path=frame_image_path,
+        input_image_rgb=input_image_rgb,
+        input_size=input_size,
+    )
+    image = image.to(device)
+
+    if skip_metric_depth_inputs:
+        return org_img, image, org_h, org_w, None, None, None, False, None
+
+    if input_depth_map is not None:
+        dh, dw = _depth_map_spatial_shape(input_depth_map)
+        assert_depth_aspect_matches_image(dh, dw, org_h, org_w)
+
+    gt_depth, prompt_depth, gt_depth_mask, use_gt_depth, moge2_intrinsics = prepare_metric_depth_inputs(
+        input_depth_path=frame_depth_path,
+        input_size=input_size,
+        image=image,
+        device=device,
+        moge2_pretrained=moge2_pretrained,
+        depth_load_kwargs=depth_load_kwargs,
+        input_depth_array=input_depth_map,
+    )
+    return org_img, image, org_h, org_w, gt_depth, prompt_depth, gt_depth_mask, use_gt_depth, moge2_intrinsics
+
+
 @torch.no_grad()
 def run_depth_inference(
     args: DepthInferenceArgs,
@@ -126,38 +231,64 @@ def run_depth_inference(
     cy_org: Optional[float] = None,
     override_gt_depth=None,
     override_gt_depth_mask=None,
+    input_image_rgb: Optional[np.ndarray] = None,
+    input_depth_map: Optional[np.ndarray] = None,
+    depth_load_kwargs: Optional[dict] = None,
 ) -> DepthInferenceResult:
+    """
+    ``fx_org``, ``fy_org``, ``cx_org``, ``cy_org`` refer to the **original** full-resolution image
+    (``org_h`` x ``org_w``), matching file-based inference.
+
+    ``input_image_rgb`` (HxWx3) and ``input_depth_map`` (HxW, same aspect ratio as that RGB, any size)
+    skip disk I/O; depth is resized with the same pipeline as ``load_depth``. ``depth_load_kwargs``
+    is forwarded to that loader (e.g. ``enable_noise_filter``, ``num_samples``).
+    """
     if model is None or device is None:
         model, device = load_depth_model(args)
 
     frame_image_path = input_image_path or args.input_image_path
     frame_depth_path = input_depth_path if input_depth_path is not None else args.input_depth_path
 
-    org_img, image, (org_h, org_w) = load_image(frame_image_path, args.input_size)
-    image = image.to(device)
+    skip_metric_depth_inputs = args.model_type == "InfiniDepth" and override_gt_depth is not None
 
     if args.model_type == "InfiniDepth_DepthSensor":
-        assert frame_depth_path is not None and os.path.exists(frame_depth_path), (
+        has_metric_depth = (
+            input_depth_map is not None
+            or (frame_depth_path is not None and os.path.exists(frame_depth_path))
+        )
+        assert has_metric_depth, (
             "InfiniDepth_DepthSensor requires a valid input depth map for depth completion. "
-            "Please provide --input_depth_path."
+            "Provide --input_depth_path or pass `input_depth_map`."
         )
 
-    skip_metric_depth_inputs = args.model_type == "InfiniDepth" and override_gt_depth is not None
-    if skip_metric_depth_inputs:
-        gt_depth = None
-        prompt_depth = None
-        gt_depth_mask = None
-        moge2_intrinsics = None
-    else:
-        gt_depth, prompt_depth, gt_depth_mask, use_gt_depth, moge2_intrinsics = prepare_metric_depth_inputs(
-            input_depth_path=frame_depth_path,
-            input_size=args.input_size,
-            image=image,
-            device=device,
-            moge2_pretrained=args.moge2_pretrained,
-        )
-        if use_gt_depth and frame_depth_path is not None:
-            print(f"metric depth from `{frame_depth_path}`")
+    (
+        org_img,
+        image,
+        org_h,
+        org_w,
+        gt_depth,
+        prompt_depth,
+        gt_depth_mask,
+        use_gt_depth,
+        moge2_intrinsics,
+    ) = load_and_preprocess_depth_inference_inputs(
+        input_size=args.input_size,
+        device=device,
+        moge2_pretrained=args.moge2_pretrained,
+        frame_image_path=frame_image_path,
+        input_image_rgb=input_image_rgb,
+        frame_depth_path=frame_depth_path,
+        input_depth_map=input_depth_map,
+        depth_load_kwargs=depth_load_kwargs,
+        skip_metric_depth_inputs=skip_metric_depth_inputs,
+    )
+
+    if not skip_metric_depth_inputs:
+        if use_gt_depth:
+            if input_depth_map is not None:
+                print("metric depth from in-memory depth map")
+            elif frame_depth_path is not None:
+                print(f"metric depth from `{frame_depth_path}`")
         else:
             print(f"metric depth from `{args.moge2_pretrained}`")
 

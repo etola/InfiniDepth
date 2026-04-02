@@ -133,6 +133,33 @@ def load_image(image_path: str,
     return org_img, image, (h, w)
 
 
+def load_image_from_array(
+    image: np.ndarray,
+    tar_size: Tuple[int, int] = (504, 672),
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+    """
+    Same contract as ``load_image``, but from an HxWx3 RGB array (uint8 or float).
+    """
+    arr = np.asarray(image)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"image must be HxWx3 RGB, got shape {arr.shape}")
+
+    if np.issubdtype(arr.dtype, np.floating):
+        mx = float(np.nanmax(arr)) if arr.size else 0.0
+        if mx <= 1.0 + 1e-3:
+            rgb_uint8 = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            rgb_uint8 = np.clip(arr, 0.0, 255.0).astype(np.uint8)
+    else:
+        rgb_uint8 = arr.astype(np.uint8)
+
+    h, w = rgb_uint8.shape[:2]
+    org_img = torch.from_numpy(rgb_uint8).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    resized = cv2.resize(rgb_uint8, tar_size[::-1], interpolation=cv2.INTER_AREA)
+    image = torch.from_numpy(resized).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    return org_img, image, (h, w)
+
+
 def _to_single_channel_depth(depth: np.ndarray, depth_path: str) -> np.ndarray:
     depth = np.asarray(depth)
     depth = np.squeeze(depth)
@@ -279,37 +306,21 @@ def read_depth_array(depth_path: str) -> np.ndarray:
     return _read_depth_array(depth_path)
 
 
-def load_depth(depth_path: str,
-               tar_size: Tuple[int, int] = (504, 672),
-               num_samples: int = 1500,
-               min_prompt: int = 1,
-               max_prompt: int = 100,
-               enable_noise_filter: bool = False,
-               filter_std_threshold: float = 0.8,
-               filter_median_threshold: float = 0.5,
-               filter_gradient_threshold: float = 0.5,
-               filter_min_neighbors: int = 5,
-               filter_bilateral_d: int = 7,
-               filter_bilateral_sigma_color: float = 1.0,
-               filter_bilateral_sigma_space: float = 10.0) -> torch.Tensor:
-    '''
-    Load depth map and optionally apply noise filtering.
-
-    Args:
-        depth_path: Path to depth file
-        tar_size: Target size (h, w)
-        num_samples: Number of samples for sparse depth prompt
-        min_prompt: Minimum depth value for valid prompt
-        max_prompt: Maximum depth value for valid prompt
-        enable_noise_filter: Whether to apply noise filtering (default: True)
-        filter_*: Noise filter parameters (see filter_depth_noise_numpy for details)
-
-    Returns:
-        depth: Full depth map (1, 1, H, W)
-        sample_depth: Sampled sparse depth (1, 1, H, W)
-        depth_mask: Valid depth mask (1, 1, H, W)
-    '''
-    depth = _read_depth_array(depth_path=depth_path)
+def _depth_numpy_to_model_tensors(
+    depth: np.ndarray,
+    tar_size: Tuple[int, int],
+    num_samples: int = 1500,
+    min_prompt: int = 1,
+    max_prompt: int = 100,
+    enable_noise_filter: bool = False,
+    filter_std_threshold: float = 0.8,
+    filter_median_threshold: float = 0.5,
+    filter_gradient_threshold: float = 0.5,
+    filter_min_neighbors: int = 5,
+    filter_bilateral_d: int = 7,
+    filter_bilateral_sigma_color: float = 1.0,
+    filter_bilateral_sigma_space: float = 10.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     depth = cv2.resize(depth, tar_size[::-1], interpolation=cv2.INTER_NEAREST)
 
     if enable_noise_filter:
@@ -349,8 +360,93 @@ def load_depth(depth_path: str,
     depth = torch.from_numpy(depth).unsqueeze(0).unsqueeze(0).float()
     sample_depth = torch.from_numpy(sample_depth).unsqueeze(0).unsqueeze(0).float()
     depth_mask = torch.from_numpy(depth_mask).unsqueeze(0).unsqueeze(0)
-   
+
     return depth, sample_depth, depth_mask
+
+
+def load_depth(depth_path: str,
+               tar_size: Tuple[int, int] = (504, 672),
+               num_samples: int = 1500,
+               min_prompt: int = 1,
+               max_prompt: int = 100,
+               enable_noise_filter: bool = False,
+               filter_std_threshold: float = 0.8,
+               filter_median_threshold: float = 0.5,
+               filter_gradient_threshold: float = 0.5,
+               filter_min_neighbors: int = 5,
+               filter_bilateral_d: int = 7,
+               filter_bilateral_sigma_color: float = 1.0,
+               filter_bilateral_sigma_space: float = 10.0) -> torch.Tensor:
+    '''
+    Load depth map and optionally apply noise filtering.
+
+    Args:
+        depth_path: Path to depth file
+        tar_size: Target size (h, w)
+        num_samples: Number of samples for sparse depth prompt
+        min_prompt: Minimum depth value for valid prompt
+        max_prompt: Maximum depth value for valid prompt
+        enable_noise_filter: Whether to apply noise filtering (default: True)
+        filter_*: Noise filter parameters (see filter_depth_noise_numpy for details)
+
+    Returns:
+        depth: Full depth map (1, 1, H, W)
+        sample_depth: Sampled sparse depth (1, 1, H, W)
+        depth_mask: Valid depth mask (1, 1, H, W)
+    '''
+    depth_np = _read_depth_array(depth_path=depth_path)
+    return _depth_numpy_to_model_tensors(
+        depth_np,
+        tar_size,
+        num_samples=num_samples,
+        min_prompt=min_prompt,
+        max_prompt=max_prompt,
+        enable_noise_filter=enable_noise_filter,
+        filter_std_threshold=filter_std_threshold,
+        filter_median_threshold=filter_median_threshold,
+        filter_gradient_threshold=filter_gradient_threshold,
+        filter_min_neighbors=filter_min_neighbors,
+        filter_bilateral_d=filter_bilateral_d,
+        filter_bilateral_sigma_color=filter_bilateral_sigma_color,
+        filter_bilateral_sigma_space=filter_bilateral_sigma_space,
+    )
+
+
+def load_depth_from_array(
+    depth: np.ndarray,
+    tar_size: Tuple[int, int] = (504, 672),
+    num_samples: int = 1500,
+    min_prompt: int = 1,
+    max_prompt: int = 100,
+    enable_noise_filter: bool = False,
+    filter_std_threshold: float = 0.8,
+    filter_median_threshold: float = 0.5,
+    filter_gradient_threshold: float = 0.5,
+    filter_min_neighbors: int = 5,
+    filter_bilateral_d: int = 7,
+    filter_bilateral_sigma_color: float = 1.0,
+    filter_bilateral_sigma_space: float = 10.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Same processing as ``load_depth`` after file read: resize to ``tar_size``,
+    optional filtering, prompt sampling. ``depth`` must be metric depth (HxW or squeezable to HxW).
+    """
+    depth_np = _to_single_channel_depth(np.asarray(depth), "<depth_array>").astype(np.float32)
+    return _depth_numpy_to_model_tensors(
+        depth_np,
+        tar_size,
+        num_samples=num_samples,
+        min_prompt=min_prompt,
+        max_prompt=max_prompt,
+        enable_noise_filter=enable_noise_filter,
+        filter_std_threshold=filter_std_threshold,
+        filter_median_threshold=filter_median_threshold,
+        filter_gradient_threshold=filter_gradient_threshold,
+        filter_min_neighbors=filter_min_neighbors,
+        filter_bilateral_d=filter_bilateral_d,
+        filter_bilateral_sigma_color=filter_bilateral_sigma_color,
+        filter_bilateral_sigma_space=filter_bilateral_sigma_space,
+    )
 
 
 def depth_to_disparity(depth: torch.Tensor) -> torch.Tensor:

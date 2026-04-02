@@ -10,7 +10,7 @@ import open3d as o3d
 
 from InfiniDepth.gs import Gaussians
 
-from .io_utils import load_depth
+from .io_utils import load_depth, load_depth_from_array
 from .moge_utils import (
     estimate_camera_intrinsics_with_moge2,
     estimate_metric_depth_and_intrinsics_with_moge2,
@@ -128,9 +128,21 @@ def prepare_metric_depth_inputs(
     moge2_pretrained: str,
     depth_load_kwargs: Optional[dict] = None,
     moge2_kwargs: Optional[dict] = None,
+    input_depth_array: Optional[np.ndarray] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, Optional[tuple[float, float, float, float]]]:
     depth_load_kwargs = depth_load_kwargs or {}
     moge2_kwargs = moge2_kwargs or {}
+
+    if input_depth_array is not None:
+        gt_depth, prompt_depth, gt_depth_mask = load_depth_from_array(
+            input_depth_array,
+            input_size,
+            **depth_load_kwargs,
+        )
+        gt_depth = gt_depth.to(device)
+        prompt_depth = prompt_depth.to(device)
+        gt_depth_mask = gt_depth_mask.to(device)
+        return gt_depth, prompt_depth, gt_depth_mask, True, None
 
     if input_depth_path is not None and os.path.exists(input_depth_path):
         gt_depth, prompt_depth, gt_depth_mask = load_depth(
