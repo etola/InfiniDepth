@@ -16,6 +16,8 @@ else:
     except ImportError:  # Allow running as a script without package context
         from parallel_executor import ParallelExecutor
 
+import logging
+logger = logging.getLogger(__name__)
 
 def compute_relative_pose(
     R1: np.ndarray, t1: np.ndarray, R2: np.ndarray, t2: np.ndarray
@@ -764,6 +766,74 @@ class ColmapInterface:
             cv2.circle(eq_image, (u, v), 5, colors[sensor_id], -1)
 
         return eq_image
+
+    def perspective_frame_depth_samples(self, frame_id: int, target_width: int, target_height: int) -> np.ndarray | None:
+        """
+        Generate depth samples for a perspective image from the frame's cameras for a given target width and height.
+        Args:
+            frame_id: ID of the frame to process
+            target_width: Width of the target image
+            target_height: Height of the target image
+        Returns:
+            depth_samples: Nx3 float array ``(u, v, z)`` in target pixel space; ``z`` is camera-frame Z (positive forward).
+            ``None`` only when there are no visible triangulated points for this image.
+        """
+        frame_info = self.get_frame_info(frame_id)
+        image_ids = frame_info["image_ids"]
+        if len(image_ids) != 1:
+            raise ValueError(f"Frame {frame_id} has {len(image_ids)} images, expected 1")
+
+        image_info = self.get_image_info(image_ids[0])
+
+        # get visible points in the frame and project them to an image of given target width and height
+        point_ids = image_info["point_ids"]
+        if len(point_ids) == 0:
+            logger.warning(f"No points found for image {image_ids[0]} in frame {frame_id}")
+            return None
+
+        K = np.asarray(image_info["K"], dtype=np.float64)
+        cam_w = float(image_info["width"])
+        cam_h = float(image_info["height"])
+        if cam_w <= 0 or cam_h <= 0:
+            raise ValueError(f"Invalid camera size ({cam_w}, {cam_h}) for frame {frame_id}")
+
+        scale_x = target_width / cam_w
+        scale_y = target_height / cam_h
+        K_scaled = K.copy()
+        K_scaled[0, 0] *= scale_x
+        K_scaled[1, 1] *= scale_y
+        K_scaled[0, 2] *= scale_x
+        K_scaled[1, 2] *= scale_y
+
+        R = np.asarray(image_info["R"], dtype=np.float64)
+        t = np.asarray(image_info["t"], dtype=np.float64).reshape(3)
+        dist = image_info["distortion_params"]
+        dist_np = None if dist is None or len(dist) == 0 else np.asarray(dist, dtype=np.float64).reshape(-1)
+
+        points_xyz = np.array([self.recon.points3D[pid].xyz for pid in point_ids], dtype=np.float64)
+        P_cam = np.einsum("ij,nj->ni", R, points_xyz) + t
+        z = P_cam[:, 2]
+
+        rvec, _ = cv2.Rodrigues(R)
+        tvec = t.reshape(3, 1)
+        uv, _ = cv2.projectPoints(points_xyz, rvec, tvec, K_scaled, dist_np)
+        uv = uv.reshape(-1, 2)
+        u, v = uv[:, 0], uv[:, 1]
+
+        inside = (
+            (z > 1e-6)
+            & np.isfinite(u)
+            & np.isfinite(v)
+            & (u >= 0.0)
+            & (u < float(target_width))
+            & (v >= 0.0)
+            & (v < float(target_height))
+        )
+        if not np.any(inside):
+            return np.empty((0, 3), dtype=np.float64)
+
+        samples = np.column_stack((u[inside], v[inside], z[inside])).astype(np.float64)
+        return cast(np.ndarray, samples)
 
 
 def main() -> None:
