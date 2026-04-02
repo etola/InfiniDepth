@@ -12,9 +12,11 @@ Usage:
 ``-fidx`` selects the n-th image when images are sorted by file name (basename).
 Outputs are written under ``{scene_folder}/{output_rel}/``.
 
+Optional ``-df`` / ``--dmap-folder``: load ``{scene_folder}/{dmap_folder}/...`` ``.npy`` or ``.tif`` / ``.tiff``
+depth per image instead of COLMAP sparse depth when a matching file exists (see ``try_load_depth_map_file``).
+
 For multiple frames in code, load ``ColmapInterface`` and the depth model once, then call
-``run_colmap_frame_depth_inference`` in a loop with different ``fidx`` (reuse the same
-``image_ids_sorted`` list from ``_sorted_image_ids``).
+``run_colmap_frame_depth_inference`` in a loop (reuse ``dmap_folder=...`` when using file depth).
 """
 
 from __future__ import annotations
@@ -108,6 +110,77 @@ def _world_to_cam_4x4(R: np.ndarray, t: np.ndarray) -> np.ndarray:
     return T
 
 
+def _read_depth_map_npy_or_tiff(path: Path) -> np.ndarray:
+    """Load a single HxW depth array from ``.npy`` (numeric ndarray only) or ``.tif`` / ``.tiff``."""
+    suf = path.suffix.lower()
+    if suf == ".npy":
+        arr = np.load(path, allow_pickle=False)
+        if not isinstance(arr, np.ndarray):
+            raise TypeError(f"Expected ndarray in {path}, got {type(arr).__name__}")
+        if arr.dtype == object:
+            raise TypeError(f"Unsupported object-dtype array in {path}")
+        d = np.asarray(arr, dtype=np.float32)
+    elif suf in (".tif", ".tiff"):
+        im = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if im is None:
+            raise ValueError(f"Failed to read TIFF: {path}")
+        if im.ndim == 3:
+            d = im[:, :, 0].astype(np.float32)
+        else:
+            d = im.astype(np.float32)
+    else:
+        raise ValueError(f"Unsupported depth file extension (use .npy, .tif, .tiff): {path}")
+
+    d = np.squeeze(d)
+    if d.ndim != 2:
+        raise ValueError(f"Expected HxW depth in {path}, got shape {d.shape}")
+    return d
+
+
+def _iter_depth_map_candidate_paths(dmap_root: Path, image_name: str):
+    """Search order: mirrored path with each ext, then ``stem.ext``, then ``name.ext`` (per ext)."""
+    rel = Path(image_name)
+    exts = (".npy", ".tif", ".tiff")
+    for ext in exts:
+        yield dmap_root / rel.with_suffix(ext)
+    for ext in exts:
+        yield dmap_root / f"{rel.stem}{ext}"
+    for ext in exts:
+        yield dmap_root / f"{rel.name}{ext}"
+
+
+def try_load_depth_map_file(
+    scene_folder: Path,
+    dmap_folder: str | Path,
+    image_name: str,
+    target_h: int,
+    target_w: int,
+) -> tuple[np.ndarray | None, Path | None]:
+    """
+    Look for a depth file under ``scene_folder / dmap_folder``.
+
+    Supported formats: ``.npy`` (plain numeric ndarray, HxW after squeeze) or ``.tif`` / ``.tiff``.
+
+    Tries paths from ``_iter_depth_map_candidate_paths``; first existing file wins.
+    Returns ``(depth_hw_float32, path_used)`` or ``(None, None)`` if none exist.
+    """
+    root = Path(scene_folder).resolve()
+    dmap_root = root / Path(dmap_folder)
+    path: Path | None = None
+    for c in _iter_depth_map_candidate_paths(dmap_root, image_name):
+        if c.is_file():
+            path = c
+            break
+    if path is None:
+        return None, None
+
+    d = _read_depth_map_npy_or_tiff(path)
+    d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+    if d.shape[0] != target_h or d.shape[1] != target_w:
+        d = cv2.resize(d, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    return d.astype(np.float32, copy=False), path
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="COLMAP scene + InfiniDepth single-frame inference.")
     p.add_argument("-sf", "--scene-folder", required=True, help="Scene root (contains images/ and sparse/).")
@@ -143,6 +216,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--enable-skyseg-model", action="store_true")
     p.add_argument("--sky-model-ckpt-path", type=str, default="checkpoints/sky/skyseg.onnx")
     p.add_argument("--no-filter-pcd", action="store_true", help="Disable statistical outlier removal on the PLY.")
+    p.add_argument(
+        "-df",
+        "--dmap-folder",
+        type=str,
+        default=None,
+        help=(
+            "Optional folder under scene_folder with per-image depth .npy files "
+            "(see try_load_depth_map_file). If set, loads that depth instead of COLMAP sparse depth when found."
+        ),
+    )
     return p.parse_args()
 
 
@@ -179,12 +262,16 @@ def run_colmap_frame_depth_inference(
     device: torch.device,
     filter_flying_points: bool = True,
     verbose: bool = True,
+    dmap_folder: str | Path | None = None,
 ) -> dict[str, str]:
     """
     Run depth inference for the ``image_id``.
 
     ``colmap``, ``model``, and ``device`` are expected to be created once by the caller.
     ``depth_args`` is a template; per-frame intrinsics and ``input_image_path`` are applied internally.
+
+    If ``dmap_folder`` is set, loads ``scene_folder/dmap_folder/...`` ``.npy`` / ``.tif`` / ``.tiff`` for this image
+    (see ``try_load_depth_map_file``); when the file exists it replaces COLMAP sparse depth.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -209,9 +296,40 @@ def run_colmap_frame_depth_inference(
     cx_org = float(K[0, 2] * su)
     cy_org = float(K[1, 2] * sv)
 
-    sparse_depth = build_sparse_metric_depth_map(colmap, image_id, image_h, image_w)
-    if float(np.max(sparse_depth)) <= 0.0:
-        logger.warning(f"No sparse SfM depth samples for image_id={image_id} ({image_path.name}).")
+    input_depth = None
+    depth_source = None
+    if dmap_folder is not None:
+        loaded, loaded_path = try_load_depth_map_file(
+            colmap.workfolder,
+            dmap_folder,
+            info["image_name"],
+            image_h,
+            image_w,
+        )
+        if loaded is not None and loaded_path is not None:
+            input_depth = loaded
+            depth_source = f"file:{loaded_path}"
+            if verbose:
+                logger.info("Using depth map from %s (instead of COLMAP sparse depth).", loaded_path)
+        else:
+            logger.warning(
+                "dmap_folder=%s set but no .npy/.tif/.tiff found for image_name=%r under %s; using COLMAP sparse depth.",
+                dmap_folder,
+                info["image_name"],
+                colmap.workfolder / Path(dmap_folder),
+            )
+
+    if input_depth is None:
+        input_depth = build_sparse_metric_depth_map(colmap, image_id, image_h, image_w)
+        depth_source = "colmap_sparse"
+
+    if float(np.max(input_depth)) <= 0.0:
+        logger.warning(
+            "No valid input depth for image_id=%s (%s); source=%s.",
+            image_id,
+            image_path.name,
+            depth_source,
+        )
 
     stem = f"{image_id:04d}_{Path(info['image_name']).stem}"
     depth_npy_path = str(out_dir / f"{stem}_depth.npy")
@@ -227,7 +345,7 @@ def run_colmap_frame_depth_inference(
         cy_org=cy_org,
     )
 
-    zmax = float(np.max(sparse_depth)) if sparse_depth.size else 0.0
+    zmax = float(np.max(input_depth)) if input_depth.size else 0.0
     depth_load_kwargs = {"max_prompt": max(zmax * 2.0, 1.0e3), "min_prompt": 1.0e-4}
 
     result = run_depth_inference(
@@ -239,7 +357,7 @@ def run_colmap_frame_depth_inference(
         fy_org=fy_org,
         cx_org=cx_org,
         cy_org=cy_org,
-        input_depth_map=sparse_depth,
+        input_depth_map=input_depth,
         depth_load_kwargs=depth_load_kwargs,
     )
 
@@ -301,6 +419,7 @@ def main() -> None:
         model=model,
         device=device,
         filter_flying_points=not bool(ns.no_filter_pcd),
+        dmap_folder=ns.dmap_folder,
     )
 
 
